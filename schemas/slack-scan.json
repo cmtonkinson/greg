@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "asks"],
+  "properties": {
+    "status": { "type": "string", "enum": ["ok", "unavailable"] },
+    "asks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pr_url", "slack_permalink", "sender", "ts"],
+        "properties": {
+          "pr_url": { "type": "string" },
+          "slack_permalink": { "type": "string" },
+          "sender": { "type": "string" },
+          "ts": { "type": "string" }
+        }
+      }
+    }
+  }
+}

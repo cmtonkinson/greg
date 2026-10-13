@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+  :root {
+    --bg: #ffffff; --surface: #f6f8fa; --fg: #1f2328; --muted: #59636e; --border: #d1d9e0;
+    --link: #0969da; --code-bg: rgba(129, 139, 152, 0.15);
+    --approve: #1a7f37; --approve-bg: #dafbe1;
+    --reject: #cf222e; --reject-bg: #ffebe9;
+    --high: #cf222e; --high-bg: #ffebe9;
+    --medium: #9a6700; --medium-bg: #fff8c5;
+    --low: #59636e; --low-bg: #eff2f5;
+    --btn-bg: #f6f8fa; --primary: #1f883d; --primary-fg: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --surface: #151b23; --fg: #e6edf3; --muted: #9198a1; --border: #3d444d;
+      --link: #4493f8; --code-bg: rgba(101, 108, 118, 0.25);
+      --approve: #3fb950; --approve-bg: rgba(46, 160, 67, 0.15);
+      --reject: #f85149; --reject-bg: rgba(248, 81, 73, 0.15);
+      --high: #f85149; --high-bg: rgba(248, 81, 73, 0.15);
+      --medium: #d29922; --medium-bg: rgba(187, 128, 9, 0.15);
+      --low: #9198a1; --low-bg: rgba(110, 118, 129, 0.15);
+      --btn-bg: #212830; --primary: #238636; --primary-fg: #ffffff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--fg); margin: 0;
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  main { max-width: 820px; margin: 0 auto; padding: 32px 16px 80px; }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code {
+    background: var(--code-bg); border-radius: 4px; padding: 0.1em 0.3em;
+    font: 0.87em ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  header { padding-bottom: 24px; border-bottom: 1px solid var(--border); }
+  .eyebrow { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+  .verdict {
+    font-weight: 700; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 3px 10px; border-radius: 999px;
+  }
+  .verdict.approve { color: var(--approve); background: var(--approve-bg); }
+  .verdict.reject { color: var(--reject); background: var(--reject-bg); }
+  .ref { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  h1 { font-size: 24px; line-height: 1.3; margin: 12px 0 10px; overflow-wrap: anywhere; }
+  .lead { font-size: 17px; margin: 0 0 16px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 13px;
+    padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted);
+  }
+  .chip b { color: var(--fg); }
+  .chip.high { color: var(--high); background: var(--high-bg); border-color: transparent; }
+  .chip.medium { color: var(--medium); background: var(--medium-bg); border-color: transparent; }
+  .chip.low { color: var(--low); background: var(--low-bg); border-color: transparent; }
+  .chip.zero { opacity: 0.5; }
+  .chip.alert { color: var(--reject); background: var(--reject-bg); border-color: transparent; }
+  .chip.alert b { color: inherit; }
+  .deps { font-size: 14px; color: var(--muted); margin: 0 0 16px; }
+  .deps div + div { margin-top: 2px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .btn {
+    display: inline-block; padding: 6px 14px; border-radius: 6px; font-size: 14px; font-weight: 500;
+    border: 1px solid var(--border); background: var(--btn-bg); color: var(--fg);
+  }
+  .btn:hover { text-decoration: none; filter: brightness(0.97); }
+  .btn.primary { background: var(--primary); border-color: transparent; color: var(--primary-fg); }
+  .meta { font-size: 13px; color: var(--muted); }
+
+  section { margin-top: 32px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 12px; }
+  ul, ol { margin: 0; padding-left: 22px; }
+  li + li { margin-top: 6px; }
+
+  .finding {
+    border: 1px solid var(--border); border-left: 4px solid var(--low); border-radius: 6px;
+    padding: 12px 14px; background: var(--surface);
+  }
+  .finding + .finding { margin-top: 10px; }
+  .finding.high { border-left-color: var(--high); }
+  .finding.medium { border-left-color: var(--medium); }
+  .finding-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 13px; }
+  .sev { font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px; padding: 1px 8px; border-radius: 999px; }
+  .finding.high .sev { color: var(--high); background: var(--high-bg); }
+  .finding.medium .sev { color: var(--medium); background: var(--medium-bg); }
+  .finding.low .sev { color: var(--low); background: var(--low-bg); }
+  .cat { color: var(--muted); }
+  .loc { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+  .finding p { margin: 0; }
+  .empty { color: var(--muted); margin: 0; }
+
+  .loc .dir { color: var(--muted); }
+  .verification { color: var(--muted); font-size: 14px; margin: 0; }
+</style>
+</head>
+<body>
+<main id="app"></main>
+<script>const DATA = {{DATA_JSON}};</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/18.1.0/lib/marked.umd.min.js"
+  integrity="sha512-vyMZJAex6630R9bwuWSFTqe36izDPqqG2Poyh/bSPvgUSQiMhsVrwXtbYGpg4TSFfWJvXKuQ3cddFwv+hA7Psw=="
+  crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.4.16/purify.min.js"
+  integrity="sha512-flQmhkXNRQ3iUfvtdCobtpMjCb6kE+zLnTiAulAQJ3WykVfy84JvCMOo6vhwWXHTXjR25h9Zj+LyGFRWKjRoag=="
+  crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/handlebars.js/4.7.10/handlebars.min.js"
+  integrity="sha512-WlBkI7Hq4MMFRfltHNMTiWEiC9LY6gutZwOe6Vx0VJoCGmHQbnIp5QIyI5KunDwuzvuDk5gehflfU4bSjq3nIw=="
+  crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script>
+(() => {
+  const { pr, review: r, custom_blocks, generated_at } = DATA;
+  const repoUrl = `https://github.com/${pr.owner}/${pr.repo}`;
+  const rich = Boolean(window.marked && window.DOMPurify);
+
+  // Review text is untrusted: it is sanitized Markdown or plain text, never raw HTML.
+  function inline(text) {
+    if (rich) return DOMPurify.sanitize(marked.parseInline(text));
+    const d = document.createElement("div");
+    d.textContent = text;
+    return d.innerHTML;
+  }
+  function el(tag, attrs = {}, ...children) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === "html") node.innerHTML = v;
+      else if (k === "text") node.textContent = v;
+      else node.setAttribute(k, v);
+    }
+    for (const c of children.flat()) if (c != null) node.append(c);
+    return node;
+  }
+  const prLink = (n, title) => el("a", { href: `${repoUrl}/pull/${n}`, title: title || "" , text: `#${n}` });
+  const safeHttps = (url) => (/^https:\/\//.test(url) ? url : null);
+  const count = (sev) => r.findings.filter((f) => f.severity === sev).length;
+  const sevLabel = { high: "High", medium: "Medium", low: "Low" };
+
+  const counts = el("div", { class: "chips" }, ["high", "medium", "low"].map((s) => {
+    const n = count(s);
+    return el("span", { class: `chip ${s}${n ? "" : " zero"}` }, el("b", { text: String(n) }), sevLabel[s]);
+  }));
+
+  const deps = el("div", { class: "deps" },
+    r.depends_on && el("div", {}, "Depends on ", prLink(r.depends_on.number, r.depends_on.title), ` ${r.depends_on.title}`),
+    r.blocks.length ? el("div", {}, "Blocks ", r.blocks.flatMap((b, i) => [i ? ", " : null, prLink(b.number, b.title)])) : null);
+
+  // Prefer the desktop app; fall back to the web permalink.
+  const slackUrl = pr.slack && ((/^slack:\/\//.test(pr.slack.app_url || "") && pr.slack.app_url) || safeHttps(pr.slack.slack_permalink));
+  const actions = el("div", { class: "actions" },
+    el("a", { class: "btn primary", href: `${pr.url}/files`, text: "Files changed", target: "_blank", rel: "noopener" }),
+    el("a", { class: "btn", href: pr.url, text: "Conversation", target: "_blank", rel: "noopener" }),
+    slackUrl && el("a", { class: "btn", href: slackUrl, text: `Slack · ${pr.slack.sender}` }));
+
+  const when = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
+    .format(new Date(generated_at));
+  const meta = el("div", { class: "meta" }, "Reviewed ",
+    el("a", { href: `${repoUrl}/commit/${pr.sha}` }, el("code", { text: pr.sha.slice(0, 7) })), ` · ${when}`);
+
+  const header = el("header", {},
+    el("div", { class: "eyebrow" },
+      el("span", { class: `verdict ${r.recommendation}`, text: r.recommendation }),
+      el("a", { class: "ref", href: pr.url, text: `${pr.owner}/${pr.repo}#${pr.number}` })),
+    el("h1", { text: pr.title }),
+    el("p", { class: "lead", html: inline(r.deciding_fact) }),
+    counts,
+    (r.depends_on || r.blocks.length) ? deps : null,
+    actions, meta);
+
+  const section = (title, ...body) => el("section", {}, el("h2", { text: title }), ...body);
+  const order = { high: 0, medium: 1, low: 2 };
+  const findings = [...r.findings].sort((a, b) => order[a.severity] - order[b.severity]).map((f) =>
+    el("article", { class: `finding ${f.severity}` },
+      el("div", { class: "finding-head" },
+        el("span", { class: "sev", text: sevLabel[f.severity] }),
+        el("span", { class: "cat", text: f.category.replace(/^\[|\]$/g, "") }),
+        el("a", { class: "loc", href: `${repoUrl}/blob/${pr.sha}/${f.path}#L${f.line}` },
+          el("span", { class: "dir", text: f.path.slice(0, f.path.lastIndexOf("/") + 1) }),
+          `${f.path.slice(f.path.lastIndexOf("/") + 1)}:${f.line}`)),
+      el("p", { html: inline(f.text) })));
+
+  // Block templates are the operator's own files; {{x}} escapes review text and
+  // {{md x}} renders it as sanitized inline Markdown.
+  if (window.Handlebars) Handlebars.registerHelper("md", (text) => new Handlebars.SafeString(inline(String(text ?? ""))));
+  const customSections = custom_blocks.map((b) => {
+    const data = r.custom_blocks?.[b.name];
+    if (data === undefined) return null;
+    const body = el("div", { class: `block-${b.name}` });
+    try {
+      if (!window.Handlebars) throw new Error("Handlebars did not load");
+      body.innerHTML = Handlebars.compile(b.template)(data);
+    } catch (e) {
+      console.error(`block ${b.name}:`, e);
+      body.append(el("p", { class: "empty", text: `Could not render this block: ${e.message}` }));
+    }
+    return section(b.title, body);
+  });
+
+  // append() would render a skipped (null) section as the text "null".
+  document.getElementById("app").append(...[
+    header,
+    section("What it does", el("ul", {}, r.what_it_does.map((t) => el("li", { html: inline(t) })))),
+    section(`Findings (${r.findings.length})`,
+      findings.length ? findings : el("p", { class: "empty", text: "No findings." })),
+    ...customSections,
+    r.questions.length ? section("Questions for the author",
+      el("ol", {}, r.questions.map((q) => el("li", { html: inline(q) })))) : null,
+    section("Verification", el("p", { class: "verification", html: inline(r.verification) })),
+  ].filter(Boolean));
+})();
+</script>
+</body>
+</html>

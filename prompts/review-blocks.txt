@@ -1,0 +1,6 @@
+<brief-blocks>
+The structured result also has a `custom_blocks` object. Fill each of its
+fields from the same review, as described below. The output rules above apply
+to every text field in a block.
+{{FIELDS}}
+</brief-blocks>

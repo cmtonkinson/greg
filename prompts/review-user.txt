@@ -1,0 +1,7 @@
+<pull-request>
+<url>{{PR_URL}}</url>
+<head-sha>{{HEAD_SHA}}</head-sha>
+<base-branch>{{BASE_REF}}</base-branch>
+</pull-request>
+
+Review this pull request with the {{SKILL}} skill.

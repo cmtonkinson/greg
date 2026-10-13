@@ -1,0 +1,6 @@
+<scan-window>
+<cutoff-instant>{{SINCE_ISO}}</cutoff-instant>
+<search-after-date>{{AFTER_DATE}}</search-after-date>
+</scan-window>
+
+Scan Slack for pull request review asks in this window.

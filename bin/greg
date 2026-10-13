@@ -1,0 +1,838 @@
+#!/usr/bin/env bash
+#
+# greg: polls GitHub and Slack for work aimed at you, briefs PRs with a review
+# skill (REVIEW_SKILL in the clone's config file, default code-review), and
+# posts actionable macOS notifications. `greg help`.
+#
+# Named in honor of Greg, who used to run billing until they cut him and spent
+# his whole salary on tokens. He warned them on his last day. This one reads
+# the 40,000 lines so you don't approve them in 3 seconds. Does anybody have
+# Greg's number? https://www.youtube.com/watch?v=3TNpOD6bov8
+#
+# shellcheck disable=SC2016 # jq programs use $vars inside single quotes.
+set -euo pipefail
+
+if ((BASH_VERSINFO[0] < 5)); then
+  echo "greg: needs bash 5 (brew install bash)" >&2
+  exit 1
+fi
+
+GREG_ROOT=$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/.." && pwd)
+GREG_HOME=${GREG_HOME:-$HOME/.local/share/greg}
+CONFIG=$GREG_ROOT/config
+REVIEW_SKILL=code-review
+BLOCK_DIR=$GREG_ROOT/blocks
+BRIEF_DIR=$HOME/pr-briefs
+SLACK_ROOT_STATE="$HOME/Library/Application Support/Slack/storage/root-state.json"
+STATE=$GREG_HOME/state.json
+LOG=$GREG_HOME/logs/greg.log
+LABEL=com.tonkinson.greg
+PLIST=$HOME/Library/LaunchAgents/$LABEL.plist
+MAX_PARALLEL_REVIEWS=3
+MAX_REVIEW_ATTEMPTS=3
+PR_RECORD_DAYS=30
+REVIEW_TIMEOUT_SECONDS=2700
+SLACK_TIMEOUT_SECONDS=600
+SLACK_FIRST_SCAN_DAYS=7
+SLACK_OVERLAP_SECONDS=3600
+SLACK_CONNECTOR="claude.ai Slack"
+SLACK_CHECK_TIMEOUT_SECONDS=60
+SLACK_RECHECK_SECONDS=86400
+STAGE_BUTTON="Stage draft review"
+ACTION_TIMEOUT_SECONDS=43200
+
+# The review agent may only read. Anything not listed is denied (dontAsk).
+REVIEW_TOOLS='Read,Grep,Glob,Agent,Skill,TodoWrite,ToolSearch,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr list:*),Bash(gh pr checks:*),Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git blame:*),Bash(git ls-files:*),Bash(git grep:*),Bash(git merge-base:*),Bash(git rev-parse:*),Bash(git branch:*),Bash(ls:*),Bash(wc:*)'
+REVIEW_DENIED_TOOLS='Edit,Write,NotebookEdit,Bash(git push:*),Bash(git commit:*),Bash(git checkout:*),Bash(git fetch:*),Bash(gh pr review:*),Bash(gh pr comment:*),Bash(gh pr merge:*),Bash(gh pr edit:*),Bash(gh pr close:*),Bash(gh api:*)'
+SLACK_TOOLS='mcp__claude_ai_Slack__slack_search_public_and_private,mcp__claude_ai_Slack__slack_read_channel,mcp__claude_ai_Slack__slack_read_thread,mcp__claude_ai_Slack__slack_read_user_profile,mcp__claude_ai_Slack__slack_search_users'
+
+# Display name for a gh pr view object: the profile name, else the login.
+JQ_PR_DEFS='def author_name: (.author.name | select(. != "" and . != null)) // .author.login;'
+
+# Reads settings from a config file of KEY=value lines; blank lines and lines
+# starting with # are skipped. An unknown key or malformed line is an error, so
+# a typo never silently falls back to a default.
+load_config() {
+  local file=$1 line
+  [[ -f $file ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    if [[ ! $line =~ ^([A-Z_]+)=(.*)$ ]]; then
+      echo "greg: $file: expected KEY=value: $line" >&2
+      return 1
+    fi
+    case ${BASH_REMATCH[1]} in
+    REVIEW_SKILL) REVIEW_SKILL=${BASH_REMATCH[2]} ;;
+    *)
+      echo "greg: $file: unknown setting ${BASH_REMATCH[1]}" >&2
+      return 1
+      ;;
+    esac
+  done <"$file"
+}
+load_config "$CONFIG" || exit 1
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Shifts an ISO 8601 UTC instant by $2 seconds.
+iso_shift() {
+  local epoch
+  epoch=$(date -u -j -f %Y-%m-%dT%H:%M:%SZ "$1" +%s)
+  date -u -r $((epoch + $2)) +%Y-%m-%dT%H:%M:%SZ
+}
+
+log() {
+  printf '%s %s\n' "$(now_iso)" "$*" >>"$LOG"
+  if [[ -t 2 ]]; then printf '%s\n' "$*" >&2; fi
+}
+
+# Replaces each {{KEY}} in the template file with its KEY=value argument.
+render() {
+  local file=$1 kv
+  shift
+  local args=()
+  for kv in "$@"; do args+=(--arg "${kv%%=*}" "${kv#*=}"); done
+  jq --raw-input --raw-output --slurp "${args[@]}" \
+    'reduce ($ARGS.named | to_entries[]) as $e (.; gsub("\\{\\{" + $e.key + "\\}\\}"; $e.value))' \
+    "$file"
+}
+
+# Locks are directories holding the owner's PID; a dead owner's lock is stale.
+lock_acquire() {
+  local dir=$GREG_HOME/locks/$1 pid
+  if mkdir "$dir" 2>/dev/null; then
+    echo "$BASHPID" >"$dir/pid"
+    return 0
+  fi
+  pid=$(cat "$dir/pid" 2>/dev/null || true)
+  if [[ -z $pid ]] || kill -0 "$pid" 2>/dev/null; then return 1; fi
+  rm -rf "$dir"
+  mkdir "$dir" 2>/dev/null || return 1
+  echo "$BASHPID" >"$dir/pid"
+}
+lock_wait() { until lock_acquire "$1"; do sleep 0.2; done; }
+lock_release() { rm -rf "$GREG_HOME/locks/$1"; }
+
+state_read() { jq "$@" "$STATE"; }
+
+# Applies a jq filter (with its arguments) to the state file under a lock.
+state_update() {
+  local tmp
+  lock_wait state
+  tmp=$(mktemp "$STATE.XXXXXX")
+  if jq "$@" "$STATE" >"$tmp"; then
+    mv "$tmp" "$STATE"
+    lock_release state
+  else
+    rm -f "$tmp"
+    lock_release state
+    return 1
+  fi
+}
+
+ensure_home() {
+  mkdir -p "$GREG_HOME"/{logs,locks,repos,worktrees,runs} "$BRIEF_DIR"
+  [[ -s $STATE ]] || echo '{"issues":{},"prs":{},"slack":{}}' >"$STATE"
+}
+
+notify() {
+  local group=$1 title=$2 subtitle=$3 message=$4
+  shift 4
+  local args=(-group "greg-$group" -title "$title" -message "$message")
+  [[ -n $subtitle ]] && args+=(-subtitle "$subtitle")
+  local rc=0
+  terminal-notifier "${args[@]}" "$@" >/dev/null || rc=$?
+  ((rc == 0)) || log "notify failed (rc=$rc): $title"
+  return "$rc"
+}
+
+# --- issues -----------------------------------------------------------------
+
+poll_issues() {
+  local issues item url
+  issues=$(gh search issues --assignee=@me --state=open --limit 200 \
+    --json url,title,number,repository)
+  while read -r item; do
+    url=$(jq -r .url <<<"$item")
+    if state_read -e --arg u "$url" '.issues | has($u)' >/dev/null; then continue; fi
+    notify "issue-$(jq -r '"\(.repository.nameWithOwner)#\(.number)"' <<<"$item")" \
+      "Issue · $(jq -r '"\(.repository.nameWithOwner)#\(.number)"' <<<"$item")" \
+      "" "$(jq -r .title <<<"$item")" -open "$url" || continue
+    state_update --arg u "$url" --arg t "$(now_iso)" '.issues[$u] = $t'
+    log "issue notified: $url"
+  done < <(jq -c '.[]' <<<"$issues")
+  # Forget issues no longer assigned, so a later reassignment notifies again.
+  state_update --argjson open "$(jq -c 'map(.url)' <<<"$issues")" \
+    '.issues |= with_entries(select(.key | IN($open[])))'
+}
+
+# --- pull requests ------------------------------------------------------------
+
+github_pr_urls() {
+  {
+    gh search prs --review-requested=@me --state=open --limit 200 --json url
+    gh search prs --assignee=@me --state=open --limit 200 --json url
+  } | jq -cs 'add | map(.url) | unique'
+}
+
+# Keeps asks whose pr_url is a GitHub PR link, rewritten to its canonical form.
+normalize_slack_asks() {
+  jq -c '
+    map(.pr_url |= (
+      (capture("^https?://(www\\.)?github\\.com/(?<o>[A-Za-z0-9_.-]+)/(?<r>[A-Za-z0-9_.-]+)/pull/(?<n>[0-9]+)") // null)
+      | if . then "https://github.com/\(.o)/\(.r)/pull/\(.n)" else null end))
+    | map(select(.pr_url))
+    | sort_by(.ts) | reverse | unique_by(.pr_url | ascii_downcase)'
+}
+
+slack_failed() {
+  log "slack scan failed: $1"
+  if state_read -e '.slack.error == null' >/dev/null; then
+    notify slack "Slack scan failing" "" "$1" -execute "open -t $(printf %q "$LOG")" || true
+  fi
+  state_update --arg e "$1" '.slack.error = $e'
+}
+
+# Pauses the Slack scan for SLACK_RECHECK_SECONDS.
+slack_unavailable() {
+  local recheck
+  recheck=$(iso_shift "$(now_iso)" "$SLACK_RECHECK_SECONDS")
+  slack_failed "$1; next check after $recheck"
+  state_update --arg t "$recheck" '.slack.recheck_at = $t'
+}
+
+# Checks the Slack connector without a model call. A missing or
+# unauthenticated connector pauses the scan; a failed connection, which may be
+# transient, skips only this tick.
+slack_connector_ready() {
+  local out rc=0
+  out=$(perl -e 'alarm shift; exec @ARGV' "$SLACK_CHECK_TIMEOUT_SECONDS" \
+    claude mcp get "$SLACK_CONNECTOR" 2>&1) || rc=$?
+  if ((rc == 0)) && grep -qE '^ *Status: .* Connected$' <<<"$out"; then
+    return 0
+  elif grep -qE 'No MCP server named|Needs authentication' <<<"$out"; then
+    slack_unavailable "$SLACK_CONNECTOR connector is missing or needs authentication"
+  else
+    slack_failed "$SLACK_CONNECTOR connector check failed: $(grep -m 1 -E 'Status:|Issue:' <<<"$out" | head -c 200)"
+  fi
+  return 1
+}
+
+# Prints the JSON array of Slack review asks since the last successful scan.
+slack_scan() {
+  local started last since after out rc recheck_at
+  recheck_at=$(state_read -r '.slack.recheck_at // empty')
+  if [[ -n $recheck_at && $(now_iso) < $recheck_at ]]; then
+    log "slack scan paused until $recheck_at"
+    echo '[]'
+    return 0
+  fi
+  if ! slack_connector_ready; then
+    echo '[]'
+    return 0
+  fi
+  started=$(now_iso)
+  last=$(state_read -r '.slack.scanned_at // empty')
+  if [[ -n $last ]]; then
+    since=$(iso_shift "$last" -"$SLACK_OVERLAP_SECONDS")
+  else
+    since=$(iso_shift "$started" -$((SLACK_FIRST_SCAN_DAYS * 86400)))
+  fi
+  # Slack's after: excludes the named day.
+  after=$(date -u -j -f %Y-%m-%dT%H:%M:%SZ -v-1d "$since" +%Y-%m-%d)
+  rc=0
+  out=$(cd "$GREG_HOME" && perl -e 'alarm shift; exec @ARGV' "$SLACK_TIMEOUT_SECONDS" \
+    claude -p "$(render "$GREG_ROOT/prompts/slack-scan-user.txt" SINCE_ISO="$since" AFTER_DATE="$after")" \
+    --append-system-prompt "$(cat "$GREG_ROOT/prompts/slack-scan-system.txt")" \
+    --setting-sources '' --disable-slash-commands --tools ToolSearch \
+    --model sonnet --effort medium --permission-mode dontAsk \
+    --output-format json --json-schema "$(cat "$GREG_ROOT/schemas/slack-scan.json")" \
+    --allowedTools "$SLACK_TOOLS" 2>>"$LOG") || rc=$?
+  if ((rc != 0)); then
+    slack_failed "claude exited $rc"
+    echo '[]'
+    return 0
+  fi
+  if jq -e '.structured_output.status == "unavailable"' <<<"$out" >/dev/null; then
+    slack_unavailable "the Slack tools did not load in the scan"
+    echo '[]'
+    return 0
+  fi
+  if ! jq -e '.structured_output.status == "ok"' <<<"$out" >/dev/null; then
+    slack_failed "$(jq -r '.structured_output.status // .result // "no structured output"' <<<"$out" | head -c 200)"
+    echo '[]'
+    return 0
+  fi
+  state_update --arg t "$started" '.slack.scanned_at = $t | .slack.error = null | del(.slack.recheck_at)'
+  jq '.structured_output.asks' <<<"$out" | normalize_slack_asks
+}
+
+# Prints one JSON object per open PR to consider: GitHub requests, Slack asks,
+# and earlier failed reviews that still have attempts left.
+build_candidates() {
+  local me=$1 gh_urls=$2 slack_asks=$3 url view retry_urls
+  retry_urls=$(state_read -c --argjson max "$MAX_REVIEW_ATTEMPTS" \
+    '[.prs | to_entries[] | select(.value.status == "failed" and .value.attempts < $max) | .key]')
+  while read -r url; do
+    if ! view=$(gh pr view "$url" --json url,number,title,headRefOid,baseRefName,state,author,additions,deletions 2>>"$LOG"); then
+      log "skip $url: gh pr view failed"
+      continue
+    fi
+    jq -c --arg me "$me" --arg asked "$url" --argjson asks "$slack_asks" \
+      --argjson prior "$(state_read -c --arg u "$url" '.prs[$u].slack // null')" "$JQ_PR_DEFS"'
+      select(.state == "OPEN" and .author.login != $me)
+      | (.url | capture("github\\.com/(?<owner>[^/]+)/(?<repo>[^/]+)/pull/")) as $m
+      | {url, number, title, sha: .headRefOid, base: .baseRefName,
+         owner: $m.owner, repo: $m.repo,
+         author: author_name,
+         churn: (.additions + .deletions),
+         slack: (($asks | map(select((.pr_url | ascii_downcase) == ($asked | ascii_downcase))) | first) // $prior)}' \
+      <<<"$view"
+  done < <(jq -rn --argjson g "$gh_urls" --argjson s "$slack_asks" --argjson f "$retry_urls" \
+    '$g + ($s | map(.pr_url)) + $f | unique | .[]')
+}
+
+# True when the PR has no finished review at this head SHA and has attempts left.
+needs_review() {
+  state_read -e --arg u "$(jq -r .url <<<"$1")" --arg sha "$(jq -r .sha <<<"$1")" \
+    --argjson max "$MAX_REVIEW_ATTEMPTS" '
+    .prs[$u] as $p
+    | $p == null or $p.sha != $sha or ($p.status == "failed" and $p.attempts < $max)' >/dev/null
+}
+
+prepare_worktree() {
+  local owner=$1 repo=$2 number=$3 base=$4 sha=$5 wt=$6
+  local clone=$GREG_HOME/repos/$owner/$repo rc=0
+  lock_wait "repo-$owner-$repo"
+  {
+    if [[ ! -d $clone/.git ]]; then
+      mkdir -p "$(dirname "$clone")"
+      gh repo clone "$owner/$repo" "$clone" -- --filter=blob:none --no-checkout --quiet
+    fi
+    git -C "$clone" fetch --quiet origin \
+      "+refs/heads/$base:refs/remotes/origin/$base" \
+      "+refs/pull/$number/head:refs/greg/pr/$number"
+    git -C "$clone" worktree prune
+    [[ -d $wt ]] || git -C "$clone" worktree add --quiet --detach "$wt" "$sha"
+  } >>"$LOG" 2>&1 || rc=$?
+  lock_release "repo-$owner-$repo"
+  return "$rc"
+}
+
+remove_worktree() {
+  local owner=$1 repo=$2 wt=$3
+  lock_wait "repo-$owner-$repo"
+  git -C "$GREG_HOME/repos/$owner/$repo" worktree remove --force "$wt" >>"$LOG" 2>&1 || true
+  lock_release "repo-$owner-$repo"
+}
+
+# Prints a slack:// link that opens a message permalink in the desktop app, or
+# nothing when the workspace is not signed in there. Slack documents slack://
+# channel links; the message parameter that selects one message is not.
+slack_app_url() {
+  local domain channel ts team
+  [[ $1 =~ ^https://([a-z0-9-]+)\.slack\.com/archives/([A-Z0-9]+)/p([0-9]{10})([0-9]{6}) ]] || return 0
+  domain=${BASH_REMATCH[1]} channel=${BASH_REMATCH[2]} ts=${BASH_REMATCH[3]}.${BASH_REMATCH[4]}
+  team=$(jq -r --arg d "$domain" \
+    'first(.. | objects | select(.domain? == $d and ((.id? // "") | startswith("T"))) | .id) // empty' \
+    "$SLACK_ROOT_STATE" 2>/dev/null || true)
+  [[ -n $team ]] && printf 'slack://channel?team=%s&id=%s&message=%s\n' "$team" "$channel" "$ts"
+  return 0
+}
+
+# Prints the brief blocks as a JSON array of {name, schema, template}. A block
+# is a pair of files in $BLOCK_DIR: <name>.json, a JSON Schema whose title heads
+# the brief section and whose description tells the reviewer what to put in it,
+# and <name>.html, a Handlebars template rendered with that data. Anything else
+# in $BLOCK_DIR is an error.
+load_blocks() {
+  local f base name blocks='[]'
+  [[ -d $BLOCK_DIR ]] || {
+    echo '[]'
+    return 0
+  }
+  for f in "$BLOCK_DIR"/*; do
+    [[ -e $f ]] || continue
+    base=${f##*/}
+    name=${base%.*}
+    if [[ -d $f || ! $base =~ ^[a-z0-9][a-z0-9-]*\.(json|html)$ ]]; then
+      echo "greg: blocks/$base: expected <name>.json or <name>.html (lowercase letters, digits, hyphens)" >&2
+      return 1
+    fi
+    if [[ ! -f $BLOCK_DIR/$name.json || ! -f $BLOCK_DIR/$name.html ]]; then
+      echo "greg: blocks/$name needs both $name.json and $name.html" >&2
+      return 1
+    fi
+    [[ $base == *.json ]] || continue
+    if ! jq -e '(.title | type) == "string" and (.description | type) == "string"' "$f" >/dev/null 2>&1; then
+      echo "greg: blocks/$base: must be a JSON Schema with a string title and description" >&2
+      return 1
+    fi
+    blocks=$(jq -c --arg name "$name" --slurpfile schema "$f" --rawfile template "$BLOCK_DIR/$name.html" \
+      '. + [{name: $name, schema: $schema[0], template: $template}]' <<<"$blocks")
+  done
+  echo "$blocks"
+}
+
+# Prints the core review schema with each block as a required field of
+# .custom_blocks. (Core .blocks lists the PRs this one blocks.)
+review_schema() {
+  jq -c --argjson blocks "$1" '
+    if $blocks == [] then . else
+      .required += ["custom_blocks"]
+      | .properties.custom_blocks = {type: "object", additionalProperties: false,
+          required: ($blocks | map(.name)),
+          properties: ($blocks | map({key: .name, value: .schema}) | from_entries)}
+    end' "$GREG_ROOT/schemas/review.json"
+}
+
+review_system_prompt() {
+  render "$GREG_ROOT/prompts/review-system.txt" SKILL="$REVIEW_SKILL"
+  if [[ $1 != '[]' ]]; then
+    render "$GREG_ROOT/prompts/review-blocks.txt" \
+      FIELDS="$(jq -r '.[] | "- `custom_blocks.\(.name)`: \(.schema.description)"' <<<"$1")"
+  fi
+}
+
+write_brief_html() {
+  local item=$1 result=$2 out=$3 generated_at=${4:-$(now_iso)} blocks
+  blocks=$(load_blocks) || return 1
+  if jq -e '.slack' <<<"$item" >/dev/null; then
+    item=$(jq -c --arg app "$(slack_app_url "$(jq -r .slack.slack_permalink <<<"$item")")" \
+      '.slack.app_url = $app' <<<"$item")
+  fi
+  # The page renders from DATA; "</" is escaped so no field can close the script.
+  render "$GREG_ROOT/templates/brief.html" \
+    TITLE="$(jq -r '"\(.owner)/\(.repo)#\(.number) · \(.title)" | @html' <<<"$item")" \
+    DATA_JSON="$(jq -cn --argjson pr "$item" --argjson review "$result" --arg t "$generated_at" \
+      --argjson blocks "$blocks" \
+      '{pr: $pr, review: $review, generated_at: $t,
+        custom_blocks: ($blocks | map({name, title: .schema.title, template}))}
+       | tojson | gsub("</"; "<\\/")' | jq -r .)" \
+    >"$out"
+}
+
+# Reviews one candidate PR (a JSON object from build_candidates).
+cmd__review() {
+  local item=$1 url owner repo number sha base title key run_dir wt blocks result rc=0
+  url=$(jq -r .url <<<"$item")
+  owner=$(jq -r .owner <<<"$item")
+  repo=$(jq -r .repo <<<"$item")
+  number=$(jq -r .number <<<"$item")
+  sha=$(jq -r .sha <<<"$item")
+  base=$(jq -r .base <<<"$item")
+  title=$(jq -r .title <<<"$item")
+  key=$owner-$repo-$number
+  lock_acquire "pr-$key" || {
+    log "skip $url: review already running"
+    return 0
+  }
+  # Expanded now: $key is local and gone by the time the EXIT trap runs.
+  # shellcheck disable=SC2064
+  trap "lock_release $(printf %q "pr-$key")" EXIT
+  run_dir=$GREG_HOME/runs/$key-${sha:0:7}
+  wt=$GREG_HOME/worktrees/$key-${sha:0:7}
+  mkdir -p "$run_dir"
+  log "review start: $url @ ${sha:0:7}"
+
+  if ! blocks=$(load_blocks 2>"$run_dir/stderr.log"); then
+    rc=1
+  elif prepare_worktree "$owner" "$repo" "$number" "$base" "$sha" "$wt"; then
+    (cd "$wt" && perl -e 'alarm shift; exec @ARGV' "$REVIEW_TIMEOUT_SECONDS" \
+      claude -p "$(render "$GREG_ROOT/prompts/review-user.txt" PR_URL="$url" HEAD_SHA="$sha" BASE_REF="$base" SKILL="$REVIEW_SKILL")" \
+      --append-system-prompt "$(review_system_prompt "$blocks")" \
+      --setting-sources user \
+      --permission-mode dontAsk --output-format json \
+      --json-schema "$(review_schema "$blocks")" \
+      --disallowedTools "$REVIEW_DENIED_TOOLS" \
+      --allowedTools "$REVIEW_TOOLS") >"$run_dir/result.json" 2>"$run_dir/stderr.log" || rc=$?
+    remove_worktree "$owner" "$repo" "$wt"
+  else
+    rc=$?
+    echo "worktree setup failed; see $LOG" >"$run_dir/stderr.log"
+  fi
+
+  if ((rc == 0)) && result=$(jq -ce '.structured_output // empty' "$run_dir/result.json" 2>/dev/null); then
+    local brief=$BRIEF_DIR/$key-${sha:0:7}.html verdict
+    write_brief_html "$item" "$result" "$brief"
+    verdict=$(jq -r '.recommendation | ascii_upcase' <<<"$result")
+    state_update --arg u "$url" --argjson item "$item" --arg brief "$brief" --arg t "$(now_iso)" \
+      --arg rec "$(jq -r .recommendation <<<"$result")" --arg result "$run_dir/result.json" \
+      '.prs[$u] = {sha: $item.sha, status: "done", attempts: 0, recommendation: $rec,
+                   brief: $brief, result: $result, slack: $item.slack, at: $t}'
+    notify_pr "$url" "$brief" "$(pr_notification "$item" "$verdict")"
+    log "review done: $url → $verdict ($brief)"
+  else
+    local attempts outcome
+    attempts=$(state_read --arg u "$url" --arg sha "$sha" \
+      'if .prs[$u].sha == $sha and .prs[$u].status == "failed" then .prs[$u].attempts + 1 else 1 end')
+    if ((attempts >= MAX_REVIEW_ATTEMPTS)); then
+      outcome="giving up after $attempts attempts"
+    else outcome="attempt $attempts of $MAX_REVIEW_ATTEMPTS; retrying next tick"; fi
+    notify "pr-$key" "Review failed · $owner/$repo#$number" "$title" "$outcome" \
+      -execute "open -t $(printf %q "$run_dir/stderr.log")" || true
+    state_update --arg u "$url" --argjson item "$item" --argjson n "$attempts" \
+      --arg log "$run_dir" --arg t "$(now_iso)" \
+      '.prs[$u] = {sha: $item.sha, status: "failed", attempts: $n, log: $log,
+                   slack: $item.slack, at: $t}'
+    log "review failed (rc=$rc, $outcome): $url; see $run_dir"
+  fi
+}
+
+# --- draft reviews ------------------------------------------------------------
+
+# Builds the pending-review payload. A finding becomes an inline comment when
+# its line falls inside a diff hunk on the new side; otherwise it goes into the
+# body, because GitHub only accepts inline comments on lines in the diff.
+build_review_payload() {
+  local result=$1 files=$2 sha=$3 repo_url=$4
+  jq -n --argjson r "$result" --argjson files "$files" --arg sha "$sha" --arg repo "$repo_url" '
+    def ranges:
+      [scan("@@ -[0-9]+(?:,[0-9]+)? \\+([0-9]+)(?:,([0-9]+))? @@")
+       | {start: (.[0] | tonumber), n: ((.[1] // "1") | tonumber)}];
+    ($files | map({key: .filename, value: ((.patch // "") | ranges)}) | from_entries) as $hunks
+    | def placeable:
+        . as $f | ($hunks[$f.path] // []) | any(.n > 0 and $f.line >= .start and $f.line < .start + .n);
+    ($r.findings | map(select(placeable))) as $inline
+    | ($r.findings | map(select(placeable | not))) as $other
+    | {commit_id: $sha,
+       body: ([$r.review_body]
+              + (if ($other | length) > 0 then
+                   ["", ($other | map("- [`\(.path):\(.line)`](\($repo)/blob/\($sha)/\(.path)#L\(.line)): \(.comment)") | join("\n"))]
+                 else [] end)
+              + (if ($r.questions | length) > 0 then
+                   ["", "Questions:", ($r.questions | map("- \(.)") | join("\n"))]
+                 else [] end)
+              | join("\n")),
+       comments: ($inline | map({path, line, side: "RIGHT", body: .comment}))}'
+}
+
+stage_failed() {
+  log "stage failed: $1: $2"
+  notify "stage-$1" "Draft review not staged" "$1" "$2" -open "$1/files" || true
+}
+
+# Creates a pending (unsubmitted) review from the brief. Only you can see it
+# until you submit it on GitHub.
+cmd_stage() {
+  local url=${1:?usage: greg stage <pr-url>} rec sha head owner repo number files payload out
+  [[ $url =~ ^https://github\.com/([^/]+)/([^/]+)/pull/([0-9]+)$ ]] || {
+    echo "greg: not a PR URL: $url" >&2
+    return 1
+  }
+  owner=${BASH_REMATCH[1]} repo=${BASH_REMATCH[2]} number=${BASH_REMATCH[3]}
+  rec=$(state_read -c --arg u "$url" '.prs[$u] // empty')
+  if ! jq -e '.status == "done" and .result' <<<"${rec:-null}" >/dev/null; then
+    stage_failed "$url" "no brief in the current format; run greg review first"
+    return 1
+  fi
+  sha=$(jq -r .sha <<<"$rec")
+  head=$(gh pr view "$url" --json headRefOid --jq .headRefOid)
+  if [[ $head != "$sha" ]]; then
+    stage_failed "$url" "the PR moved from ${sha:0:7} to ${head:0:7}; the next tick briefs the new head"
+    return 1
+  fi
+  files=$(gh api --paginate "repos/$owner/$repo/pulls/$number/files" --jq '.[] | {filename, patch}' | jq -cs .)
+  payload=$(build_review_payload "$(jq -c .structured_output "$(jq -r .result <<<"$rec")")" \
+    "$files" "$sha" "https://github.com/$owner/$repo")
+  # On failure gh prints GitHub's JSON error body on stdout. GitHub allows one
+  # pending review per user per PR, so an open draft makes this fail (422).
+  if ! out=$(gh api -X POST "repos/$owner/$repo/pulls/$number/reviews" --input - <<<"$payload" 2>>"$LOG"); then
+    out=$(jq -r '([.errors[]? | if type == "string" then . else .message end] | first) // .message // empty' \
+      <<<"$out" 2>/dev/null || true)
+    stage_failed "$url" "${out:-GitHub API call failed; see $LOG}"
+    return 1
+  fi
+  log "draft review staged: $url ($(jq '.comments | length' <<<"$payload") inline)"
+  open -u "$url/files"
+  notify "pr-$owner-$repo-$number" "Draft review staged · $owner/$repo#$number" "" \
+    "$(jq -r '"\(.comments | length) inline comment(s). Edit, then submit or discard it on GitHub."' <<<"$payload")" \
+    -open "$url/files" || true
+}
+
+# Prints a PR notification as {title, subtitle, message}. The input needs owner,
+# repo, number, author, churn, and slack. Slack asks name the asker; GitHub
+# requests name the PR author.
+pr_notification() {
+  jq -c --arg verdict "$2" '{
+    title: "\(.owner)/\(.repo)#\(.number) — \($verdict)",
+    subtitle: (if .slack then "\(.slack.sender) via Slack" else "\(.author) via GitHub" end),
+    message: "\(.churn) lines changed"}' <<<"$1"
+}
+
+# Posts a PR notification from its own process, replacing any earlier one for
+# the PR. launchd keeps that process after the tick ends (AbandonProcessGroup).
+notify_pr() {
+  local url=$1 brief=$2 note=$3
+  pkill -f "greg _await $url " 2>/dev/null || true
+  nohup "$GREG_ROOT/bin/greg" _await "$url" "$brief" "$(jq -r .title <<<"$note")" \
+    "$(jq -r .subtitle <<<"$note")" "$(jq -r .message <<<"$note")" >/dev/null 2>&1 &
+}
+
+# Posts a PR's brief notification and waits for the click (internal). Briefs
+# from before draft reviews existed cannot be staged, so they get no button.
+cmd__await() {
+  local url=$1 brief=$2 title=$3 subtitle=$4 message=$5 answer rc=0 group
+  [[ $url =~ ^https://github\.com/([^/]+)/([^/]+)/pull/([0-9]+)$ ]] || return 1
+  group=greg-pr-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}
+  pkill -f "terminal-notifier -group $group " 2>/dev/null || true
+  if ! state_read -e --arg u "$url" '.prs[$u].result' >/dev/null; then
+    notify "${group#greg-}" "$title" "$subtitle" "$message" \
+      -execute "open -u $(printf %q "$url/files"); open $(printf %q "$brief")" || true
+    return 0
+  fi
+  answer=$(terminal-notifier -group "$group" \
+    -title "$title" -subtitle "$subtitle" -message "$message" \
+    -action "$STAGE_BUTTON" -timeout "$ACTION_TIMEOUT_SECONDS" 2>>"$LOG") || rc=$?
+  case $answer in
+  "$STAGE_BUTTON") cmd_stage "$url" || true ;;
+  @ACTIONCLICKED)
+    open -u "$url/files"
+    open "$brief"
+    ;;
+  @CLOSED | @TIMEOUT) ;;
+  *) log "notify failed (rc=$rc): $title" ;;
+  esac
+}
+
+# --- inbox --------------------------------------------------------------------
+
+# Prints one JSON object per briefed PR you have not actioned. Actioned means
+# the PR is merged or closed, or you submitted a review after its brief.
+pending_prs() {
+  local me url rec
+  me=$(gh api user --jq .login)
+  while read -r url; do
+    rec=$(state_read -c --arg u "$url" '.prs[$u]')
+    gh pr view "$url" --json url,number,title,state,author,additions,deletions,reviews 2>>"$LOG" |
+      jq -c --arg me "$me" --argjson rec "$rec" "$JQ_PR_DEFS"'
+        (.url | capture("github\\.com/(?<owner>[^/]+)/(?<repo>[^/]+)/pull/")) as $m
+        | select(.state == "OPEN")
+        | select(any(.reviews[]; .author.login == $me and .state != "PENDING"
+                                 and (.submittedAt // "") > $rec.at) | not)
+        | {url, number, title, owner: $m.owner, repo: $m.repo,
+           author: author_name,
+           churn: (.additions + .deletions),
+           verdict: ($rec.recommendation | ascii_upcase), brief: $rec.brief, slack: $rec.slack}' || true
+  done < <(state_read -r '.prs | to_entries[] | select(.value.status == "done") | .key')
+}
+
+# Prints one JSON object per assigned issue that is still open.
+pending_issues() {
+  local url
+  while read -r url; do
+    gh issue view "$url" --json url,number,title,state 2>>"$LOG" |
+      jq -c 'select(.state == "OPEN")
+        | . + (.url | capture("github\\.com/(?<owner>[^/]+)/(?<repo>[^/]+)/issues/"))' || true
+  done < <(state_read -r '.issues | keys[]')
+}
+
+cmd_inbox() {
+  local pr issue n=0
+  echo "PRs awaiting you:"
+  while read -r pr; do
+    n=$((n + 1))
+    pr_notification "$pr" "$(jq -r .verdict <<<"$pr")" |
+      jq -r --argjson pr "$pr" '"  \(.title)\n    \(.subtitle), \(.message)\n    \($pr.title)\n    file://\($pr.brief)"'
+  done < <(pending_prs)
+  ((n > 0)) || echo "  none"
+  n=0
+  echo "Issues assigned to you:"
+  while read -r issue; do
+    n=$((n + 1))
+    jq -r '"  \(.owner)/\(.repo)#\(.number)\n    \(.title)\n    \(.url)"' <<<"$issue"
+  done < <(pending_issues)
+  ((n > 0)) || echo "  none"
+  state_read -r '.prs | to_entries[] | select(.value.status == "failed")
+    | "Failed review: \(.key) (attempt \(.value.attempts)); see \(.value.log)"'
+}
+
+# Re-posts notifications for everything not yet actioned, or for one URL.
+cmd_renotify() {
+  local target=${1:-} pr issue url n=0
+  while read -r pr; do
+    url=$(jq -r .url <<<"$pr")
+    [[ -z $target || $url == "$target" ]] || continue
+    notify_pr "$url" "$(jq -r .brief <<<"$pr")" "$(pr_notification "$pr" "$(jq -r .verdict <<<"$pr")")"
+    n=$((n + 1))
+  done < <(pending_prs)
+  while read -r issue; do
+    url=$(jq -r .url <<<"$issue")
+    [[ -z $target || $url == "$target" ]] || continue
+    notify "issue-$(jq -r '"\(.owner)/\(.repo)#\(.number)"' <<<"$issue")" \
+      "Issue · $(jq -r '"\(.owner)/\(.repo)#\(.number)"' <<<"$issue")" "" \
+      "$(jq -r .title <<<"$issue")" -open "$url" || true
+    n=$((n + 1))
+  done < <(pending_issues)
+  echo "re-posted $n notification(s)"
+  if [[ -n $target ]] && ((n == 0)); then
+    echo "greg: $target is not awaiting you (actioned, closed, or never briefed)" >&2
+    return 1
+  fi
+}
+
+# Rebuilds every brief from its saved review, for example after a template
+# change. Title, author, and churn are read fresh from GitHub.
+cmd_rerender() {
+  local url rec view item n=0
+  while read -r url; do
+    rec=$(state_read -c --arg u "$url" '.prs[$u]')
+    if ! view=$(gh pr view "$url" --json number,title,baseRefName,author,additions,deletions 2>>"$LOG"); then
+      log "rerender skipped $url: gh pr view failed"
+      continue
+    fi
+    item=$(jq -c --arg url "$url" --argjson rec "$rec" "$JQ_PR_DEFS"'
+      ($url | capture("github\\.com/(?<owner>[^/]+)/(?<repo>[^/]+)/pull/")) as $m
+      | {url: $url, number, title, sha: $rec.sha, base: .baseRefName, owner: $m.owner, repo: $m.repo,
+         author: author_name, churn: (.additions + .deletions), slack: $rec.slack}' <<<"$view")
+    write_brief_html "$item" "$(jq -c .structured_output "$(jq -r .result <<<"$rec")")" \
+      "$(jq -r .brief <<<"$rec")" "$(jq -r .at <<<"$rec")"
+    n=$((n + 1))
+  done < <(state_read -r '.prs | to_entries[] | select(.value.status == "done" and .value.result) | .key')
+  echo "re-rendered $n brief(s)"
+}
+
+# --- commands -----------------------------------------------------------------
+
+cmd_tick() {
+  if [[ -e $GREG_HOME/paused ]]; then
+    log "paused; tick skipped"
+    return 0
+  fi
+  # Ticking without notifications would mark work as seen that you never saw.
+  if ! terminal-notifier -diagnose >/dev/null 2>&1; then
+    log "notifications not authorized (terminal-notifier -diagnose); tick skipped"
+    return 0
+  fi
+  lock_acquire tick || {
+    log "previous tick still running; tick skipped"
+    return 0
+  }
+  trap 'lock_release tick' EXIT
+  log "tick start"
+  local me gh_urls slack_asks candidates item
+  local queue=()
+  me=$(gh api user --jq .login)
+  poll_issues
+  gh_urls=$(github_pr_urls)
+  slack_asks=$(slack_scan)
+  # Merge duplicates (the same PR can arrive by GitHub and by Slack).
+  candidates=$(build_candidates "$me" "$gh_urls" "$slack_asks" |
+    jq -cs 'group_by(.url) | map(.[0] + {slack: (map(.slack | select(.)) | first)})')
+  while read -r item; do
+    needs_review "$item" && queue+=("$item")
+  done < <(jq -c '.[]' <<<"$candidates")
+  # Keep a record while its PR is a candidate, and for $PR_RECORD_DAYS after,
+  # so a stale Slack ask never re-reviews a SHA already briefed.
+  state_update --argjson c "$(jq -c 'map(.url)' <<<"$candidates")" \
+    --arg cutoff "$(iso_shift "$(now_iso)" -$((PR_RECORD_DAYS * 86400)))" \
+    '.prs |= with_entries(select((.key | IN($c[])) or .value.at > $cutoff))'
+  log "candidates: $(jq length <<<"$candidates"), to review: ${#queue[@]}"
+  if ((${#queue[@]} > 0)); then
+    printf '%s\0' "${queue[@]}" |
+      xargs -0 -n 1 -P "$MAX_PARALLEL_REVIEWS" "$GREG_ROOT/bin/greg" _review || true
+  fi
+  state_update --arg t "$(now_iso)" '.last_tick = $t'
+  log "tick done"
+}
+
+cmd_review() {
+  local url=${1:?usage: greg review <pr-url>} me item
+  me=$(gh api user --jq .login)
+  item=$(build_candidates "$me" "$(jq -cn --arg u "$url" '[$u]')" '[]')
+  [[ -n $item ]] || {
+    echo "greg: $url is not an open PR by someone else" >&2
+    return 1
+  }
+  cmd__review "$item"
+}
+
+cmd_status() {
+  local pid dir
+  if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
+    printf 'schedule:   installed, every 20 min'
+  else
+    printf 'schedule:   not installed (greg install)'
+  fi
+  [[ -e $GREG_HOME/paused ]] && printf ', PAUSED'
+  echo
+  state_read -r '"last tick:  \(.last_tick // "never")",
+    "slack scan: \(.slack.scanned_at // "never")\(if .slack.error then " (failing: \(.slack.error))" else "" end)",
+    "issues:     \(.issues | length) assigned",
+    "PRs:        \(.prs | map(select(.status == "done")) | length) briefed, \(.prs | map(select(.status == "failed")) | length) failed"'
+  for dir in "$GREG_HOME"/locks/pr-*; do
+    [[ -d $dir ]] || continue
+    pid=$(cat "$dir/pid" 2>/dev/null || true)
+    [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null && echo "reviewing:  ${dir##*/pr-}"
+  done
+  state_read -r '.prs | to_entries[] | select(.value.status == "failed")
+    | "failed:     \(.key) (attempt \(.value.attempts)) \(.value.log)"'
+  echo "log:        $LOG"
+}
+
+cmd_install() {
+  mkdir -p "$(dirname "$PLIST")"
+  render "$GREG_ROOT/launchd/$LABEL.plist" \
+    LABEL="$LABEL" GREG_BIN="$GREG_ROOT/bin/greg" HOME="$HOME" \
+    PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    LAUNCHD_LOG="$GREG_HOME/logs/launchd.log" >"$PLIST"
+  launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$UID" "$PLIST"
+  echo "installed $PLIST; first tick runs now"
+}
+
+cmd_uninstall() {
+  launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+  rm -f "$PLIST"
+  echo "uninstalled"
+}
+
+cmd_update() {
+  GREG_SRC=$GREG_ROOT exec sh "$GREG_ROOT/install.sh"
+}
+
+cmd_help() {
+  cat <<'EOF'
+usage: greg <command>
+  now          run a tick in the foreground
+  review URL   brief one PR now, ignoring what was already reviewed
+  stage URL    create a draft (pending) GitHub review from the PR's brief
+  inbox        list briefed PRs and assigned issues you have not actioned
+  renotify [URL]  re-post notifications for everything in the inbox, or one URL
+  rerender     rebuild every brief from its saved review (after a template change)
+  status       schedule, last tick, Slack scan, in-flight and failed reviews
+  pause        skip scheduled ticks until resume
+  resume       resume scheduled ticks
+  install      install and start the launchd schedule (every 20 minutes)
+  uninstall    stop and remove the launchd schedule
+  update       update greg to the latest version (the schedule keeps running)
+EOF
+}
+
+main() {
+  ensure_home
+  case ${1:-help} in
+  now | tick) cmd_tick ;;
+  review) cmd_review "${2:-}" ;;
+  _review) cmd__review "$2" ;;
+  stage) cmd_stage "${2:-}" ;;
+  inbox) cmd_inbox ;;
+  renotify) cmd_renotify "${2:-}" ;;
+  rerender) cmd_rerender ;;
+  _await) shift && cmd__await "$@" ;;
+  status) cmd_status ;;
+  pause) touch "$GREG_HOME/paused" && echo paused ;;
+  resume) rm -f "$GREG_HOME/paused" && echo resumed ;;
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  update) cmd_update ;;
+  help | -h | --help) cmd_help ;;
+  greg) echo "Great question." && open -u "https://www.youtube.com/watch?v=3TNpOD6bov8" ;;
+  *)
+    cmd_help >&2
+    return 1
+    ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
